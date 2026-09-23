@@ -1,0 +1,175 @@
+const http = require("http");
+const WebSocket = require("ws");
+const { createServer } = require("../server/wsServer");
+const { RGA } = require("../src/crdt");
+
+/** Attaches a persistent message buffer to a websocket so tests can wait
+ * for a specific message type even if it already arrived before the wait
+ * call was made — avoids race conditions with messages sent back-to-back,
+ * like 'history' immediately followed by 'presence' on connect. Returns a
+ * `waitFor(type)` function scoped to this socket. */
+function bufferMessages(ws) {
+  const buffer = [];
+  const waiters = []; // { type, resolve }
+
+  ws.on("message", (raw) => {
+    const msg = JSON.parse(raw.toString());
+    const waiterIdx = waiters.findIndex((w) => w.type === msg.type);
+    if (waiterIdx !== -1) {
+      const [waiter] = waiters.splice(waiterIdx, 1);
+      waiter.resolve(msg);
+    } else {
+      buffer.push(msg);
+    }
+  });
+
+  return function waitFor(type, timeoutMs = 4000) {
+    const bufferedIdx = buffer.findIndex((m) => m.type === type);
+    if (bufferedIdx !== -1) {
+      return Promise.resolve(buffer.splice(bufferedIdx, 1)[0]);
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = waiters.findIndex((w) => w.resolve === wrappedResolve);
+        if (idx !== -1) waiters.splice(idx, 1);
+        reject(new Error(`Timed out waiting for message type '${type}'`));
+      }, timeoutMs);
+      const wrappedResolve = (msg) => {
+        clearTimeout(timer);
+        resolve(msg);
+      };
+      waiters.push({ type, resolve: wrappedResolve });
+    });
+  };
+}
+
+describe("WebSocket relay server (real client connections)", () => {
+  let httpServer, port;
+
+  beforeEach((done) => {
+    httpServer = http.createServer();
+    createServer({ server: httpServer });
+    httpServer.listen(0, () => {
+      port = httpServer.address().port;
+      done();
+    });
+  });
+
+  afterEach((done) => {
+    httpServer.close(() => done());
+  });
+
+  function connect(doc, siteId) {
+    const ws = new WebSocket(`ws://localhost:${port}/ws?doc=${doc}&siteId=${siteId}`);
+    return { ws, waitFor: bufferMessages(ws) };
+  }
+
+  test("a new client receives an empty history for a brand-new document", async () => {
+    const { ws, waitFor } = connect("doc1", "site1");
+    const historyMsg = await waitFor("history");
+    expect(historyMsg.ops).toEqual([]);
+    ws.close();
+  });
+
+  test("an op sent by one client is broadcast to another client in the same document", async () => {
+    const alice = connect("shared-doc", "alice");
+    const bob = connect("shared-doc", "bob");
+
+    await Promise.all([alice.waitFor("history"), bob.waitFor("history")]);
+
+    const opPromise = bob.waitFor("op");
+    alice.ws.send(JSON.stringify({ type: "insert", id: "1@alice", char: "H", originId: null }));
+
+    const received = await opPromise;
+    expect(received.op.char).toBe("H");
+
+    alice.ws.close();
+    bob.ws.close();
+  });
+
+  test("a client joining after ops were sent receives the full history on connect", async () => {
+    const alice = connect("history-doc", "alice");
+    await alice.waitFor("history");
+
+    alice.ws.send(JSON.stringify({ type: "insert", id: "1@alice", char: "X", originId: null }));
+    await new Promise((r) => setTimeout(r, 100)); // let the server record it
+
+    const bob = connect("history-doc", "bob");
+    const bobHistory = await bob.waitFor("history");
+
+    expect(bobHistory.ops).toHaveLength(1);
+    expect(bobHistory.ops[0].char).toBe("X");
+
+    alice.ws.close();
+    bob.ws.close();
+  });
+
+  test("presence count reflects the number of connected clients on the same document", async () => {
+    const alice = connect("presence-doc", "alice");
+    await alice.waitFor("history");
+    const firstPresence = await alice.waitFor("presence");
+    expect(firstPresence.count).toBe(1);
+
+    const secondPresencePromise = alice.waitFor("presence");
+    const bob = connect("presence-doc", "bob");
+    await bob.waitFor("history");
+
+    const secondPresence = await secondPresencePromise;
+    expect(secondPresence.count).toBe(2);
+
+    alice.ws.close();
+    bob.ws.close();
+  });
+
+  test("end-to-end: two real RGA replicas converge via real WebSocket messages", async () => {
+    const aliceRga = new RGA("alice");
+    const bobRga = new RGA("bob");
+
+    const alice = connect("e2e-doc", "alice");
+    const bob = connect("e2e-doc", "bob");
+
+    await Promise.all([alice.waitFor("history"), bob.waitFor("history")]);
+
+    const bobOpPromise1 = bob.waitFor("op");
+    const op1 = aliceRga.localInsert(0, "H");
+    alice.ws.send(JSON.stringify(op1));
+    bobRga.applyRemote((await bobOpPromise1).op);
+
+    const bobOpPromise2 = bob.waitFor("op");
+    const op2 = aliceRga.localInsert(1, "i");
+    alice.ws.send(JSON.stringify(op2));
+    bobRga.applyRemote((await bobOpPromise2).op);
+
+    expect(bobRga.toText()).toBe("Hi");
+    expect(bobRga.toText()).toBe(aliceRga.toText());
+
+    alice.ws.close();
+    bob.ws.close();
+  });
+
+  test("documents are isolated from each other — ops in one doc don't leak into another", async () => {
+    const clientA = connect("doc-A", "a1");
+    const clientB = connect("doc-B", "b1");
+    await Promise.all([clientA.waitFor("history"), clientB.waitFor("history")]);
+
+    const clientA2 = connect("doc-A", "a2");
+    await clientA2.waitFor("history");
+
+    let leaked = false;
+    clientB.ws.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === "op") leaked = true;
+    });
+
+    const a2Received = clientA2.waitFor("op");
+    clientA.ws.send(JSON.stringify({ type: "insert", id: "1@a1", char: "Z", originId: null }));
+    await a2Received; // confirms same-doc delivery works at all
+
+    await new Promise((r) => setTimeout(r, 100));
+    expect(leaked).toBe(false);
+
+    clientA.ws.close();
+    clientB.ws.close();
+    clientA2.ws.close();
+  });
+});
