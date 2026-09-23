@@ -1,0 +1,298 @@
+const { RGA, compareIds } = require("../src/crdt");
+
+describe("compareIds", () => {
+  test("higher counter sorts higher", () => {
+    expect(compareIds("1@a", "2@a")).toBeLessThan(0);
+    expect(compareIds("5@a", "2@a")).toBeGreaterThan(0);
+  });
+
+  test("equal counters tie-break on siteId", () => {
+    expect(compareIds("1@alice", "1@bob")).toBeLessThan(0);
+    expect(compareIds("1@bob", "1@alice")).toBeGreaterThan(0);
+  });
+
+  test("identical ids compare equal", () => {
+    expect(compareIds("3@alice", "3@alice")).toBe(0);
+  });
+});
+
+describe("RGA basic single-site operations", () => {
+  test("inserting into an empty document", () => {
+    const rga = new RGA("site1");
+    rga.localInsert(0, "H");
+    rga.localInsert(1, "i");
+    expect(rga.toText()).toBe("Hi");
+  });
+
+  test("inserting in the middle shifts subsequent characters", () => {
+    const rga = new RGA("site1");
+    "Hello".split("").forEach((c, i) => rga.localInsert(i, c));
+    rga.localInsert(5, "!");
+    expect(rga.toText()).toBe("Hello!");
+    rga.localInsert(5, ",");
+    expect(rga.toText()).toBe("Hello,!");
+  });
+
+  test("deleting a character removes it from visible text", () => {
+    const rga = new RGA("site1");
+    "Hello".split("").forEach((c, i) => rga.localInsert(i, c));
+    rga.localDelete(0); // remove 'H'
+    expect(rga.toText()).toBe("ello");
+  });
+
+  test("deleted nodes remain as tombstones, not removed from the structure", () => {
+    const rga = new RGA("site1");
+    rga.localInsert(0, "A");
+    rga.localDelete(0);
+    expect(rga.toText()).toBe("");
+    expect(rga.size()).toBe(1); // tombstone still present
+  });
+
+  test("localDelete on an out-of-range index returns null and is a no-op", () => {
+    const rga = new RGA("site1");
+    rga.localInsert(0, "A");
+    const op = rga.localDelete(5);
+    expect(op).toBeNull();
+    expect(rga.toText()).toBe("A");
+  });
+
+  test("typing a full sentence character by character produces the expected text", () => {
+    const rga = new RGA("site1");
+    const sentence = "The quick brown fox";
+    sentence.split("").forEach((c, i) => rga.localInsert(i, c));
+    expect(rga.toText()).toBe(sentence);
+  });
+});
+
+describe("RGA remote operation application", () => {
+  test("applying a remote insert op updates the replica", () => {
+    const alice = new RGA("alice");
+    const bob = new RGA("bob");
+
+    const op = alice.localInsert(0, "H");
+    bob.applyRemote(op);
+
+    expect(bob.toText()).toBe("H");
+  });
+
+  test("applying the same insert op twice is idempotent", () => {
+    const alice = new RGA("alice");
+    const bob = new RGA("bob");
+
+    const op = alice.localInsert(0, "X");
+    bob.applyRemote(op);
+    bob.applyRemote(op); // duplicate delivery
+
+    expect(bob.toText()).toBe("X");
+    expect(bob.size()).toBe(1);
+  });
+
+  test("applying the same delete op twice is idempotent", () => {
+    const alice = new RGA("alice");
+    const bob = new RGA("bob");
+
+    const insertOp = alice.localInsert(0, "X");
+    bob.applyRemote(insertOp);
+    const deleteOp = alice.localDelete(0);
+    bob.applyRemote(deleteOp);
+    bob.applyRemote(deleteOp); // duplicate delivery
+
+    expect(bob.toText()).toBe("");
+  });
+});
+
+describe("RGA out-of-order delivery buffering", () => {
+  test("an insert arriving before its origin is buffered, then applied once the origin arrives", () => {
+    const alice = new RGA("alice");
+    const bob = new RGA("bob");
+
+    const opA = alice.localInsert(0, "A"); // origin: null
+    const opB = alice.localInsert(1, "B"); // origin: opA.id
+
+    // Deliver out of order: B before A.
+    bob.applyRemote(opB);
+    expect(bob.toText()).toBe(""); // B is buffered, waiting on A
+
+    bob.applyRemote(opA);
+    expect(bob.toText()).toBe("AB"); // now both applied, in correct order
+  });
+
+  test("a delete arriving before its target insert is buffered, then applied once the insert arrives", () => {
+    const alice = new RGA("alice");
+    const bob = new RGA("bob");
+
+    const opA = alice.localInsert(0, "A");
+    const deleteOp = alice.localDelete(0);
+
+    bob.applyRemote(deleteOp); // arrives first — target doesn't exist yet
+    expect(bob.toText()).toBe("");
+
+    bob.applyRemote(opA); // now the insert arrives
+    expect(bob.toText()).toBe(""); // and gets immediately deleted per the buffered op
+    expect(bob.size()).toBe(1); // tombstone present
+  });
+
+  test("a chain of three out-of-order inserts eventually converges once all arrive", () => {
+    const alice = new RGA("alice");
+    const bob = new RGA("bob");
+
+    const opA = alice.localInsert(0, "A");
+    const opB = alice.localInsert(1, "B");
+    const opC = alice.localInsert(2, "C");
+
+    // Deliver in reverse order.
+    bob.applyRemote(opC);
+    bob.applyRemote(opB);
+    expect(bob.toText()).toBe(""); // still waiting on A
+    bob.applyRemote(opA);
+
+    expect(bob.toText()).toBe("ABC");
+  });
+});
+
+describe("RGA concurrent editing convergence", () => {
+  test("two sites inserting at the same position concurrently converge to the same text, regardless of delivery order", () => {
+    // Both start from "AC" and concurrently insert 'B' at index 1 (between A and C).
+    const alice = new RGA("alice");
+    const bob = new RGA("bob");
+
+    const opA = alice.localInsert(0, "A");
+    bob.applyRemote(opA);
+    const opC = alice.localInsert(1, "C");
+    bob.applyRemote(opC);
+
+    expect(alice.toText()).toBe("AC");
+    expect(bob.toText()).toBe("AC");
+
+    // Now both concurrently insert at index 1 (between A and C).
+    const aliceOp = alice.localInsert(1, "X");
+    const bobOp = bob.localInsert(1, "Y");
+
+    // Deliver to each other in OPPOSITE orders on purpose.
+    alice.applyRemote(bobOp);
+    bob.applyRemote(aliceOp);
+
+    // Both must converge to the identical string, whatever that string is —
+    // this is the entire point of a CRDT.
+    expect(alice.toText()).toBe(bob.toText());
+    expect(alice.toText().length).toBe(4);
+  });
+
+  test("concurrent delete and insert at overlapping positions converge", () => {
+    const alice = new RGA("alice");
+    const bob = new RGA("bob");
+
+    ["H", "e", "l", "l", "o"].forEach((c, i) => {
+      const op = alice.localInsert(i, c);
+      bob.applyRemote(op);
+    });
+    expect(alice.toText()).toBe("Hello");
+    expect(bob.toText()).toBe("Hello");
+
+    // Alice deletes the first 'l' (index 2); Bob concurrently inserts '!' at the end.
+    const deleteOp = alice.localDelete(2);
+    const insertOp = bob.localInsert(5, "!");
+
+    alice.applyRemote(insertOp);
+    bob.applyRemote(deleteOp);
+
+    expect(alice.toText()).toBe(bob.toText());
+    expect(alice.toText()).toBe("Helo!");
+  });
+
+  test("three concurrent sites all inserting at the same origin converge to one consistent order", () => {
+    const a = new RGA("a");
+    const b = new RGA("b");
+    const c = new RGA("c");
+
+    const base = a.localInsert(0, "-");
+    b.applyRemote(base);
+    c.applyRemote(base);
+
+    // All three concurrently insert a distinct char right after "-".
+    const opA = a.localInsert(1, "A");
+    const opB = b.localInsert(1, "B");
+    const opC = c.localInsert(1, "C");
+
+    // Deliver all three ops to all three replicas, each in a DIFFERENT order.
+    [opB, opC].forEach((op) => a.applyRemote(op));
+    [opA, opC].forEach((op) => b.applyRemote(op));
+    [opB, opA].forEach((op) => c.applyRemote(op));
+
+    expect(a.toText()).toBe(b.toText());
+    expect(b.toText()).toBe(c.toText());
+    expect(a.toText().length).toBe(4);
+  });
+});
+
+describe("RGA randomized convergence stress test", () => {
+  // This is the test that actually PROVES the CRDT is correct, rather than
+  // just checking a few hand-picked scenarios: simulate N replicas each
+  // performing random local edits, exchange all operations in a random
+  // (non-causal-respecting-per-replica, but per-op-causally-buffered)
+  // order, and assert every replica ends up byte-for-byte identical.
+  function randomChar() {
+    const chars = "abcdefghij";
+    return chars[Math.floor(Math.random() * chars.length)];
+  }
+
+  function runConvergenceTrial(seed) {
+    let rngState = seed;
+    const rng = () => {
+      // simple deterministic PRNG (mulberry32) for reproducible failures
+      rngState |= 0;
+      rngState = (rngState + 0x6d2b79f5) | 0;
+      let t = Math.imul(rngState ^ (rngState >>> 15), 1 | rngState);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+
+    const siteIds = ["site-A", "site-B", "site-C"];
+    const replicas = siteIds.map((id) => new RGA(id));
+    const allOps = []; // { op, generatedByReplicaIndex }
+
+    // Each replica performs a handful of random local operations against
+    // its OWN current view (applying its own ops immediately, as a real
+    // editor would), recording every op it generates.
+    const NUM_OPS_PER_SITE = 15;
+    for (let i = 0; i < NUM_OPS_PER_SITE; i++) {
+      replicas.forEach((replica, idx) => {
+        const text = replica.toText();
+        const doInsert = text.length === 0 || rng() < 0.7;
+        if (doInsert) {
+          const pos = Math.floor(rng() * (text.length + 1));
+          const op = replica.localInsert(pos, randomChar());
+          allOps.push({ op, from: idx });
+        } else {
+          const pos = Math.floor(rng() * text.length);
+          const op = replica.localDelete(pos);
+          if (op) allOps.push({ op, from: idx });
+        }
+      });
+    }
+
+    // Now propagate every op to every OTHER replica, in a random order per
+    // destination replica (simulating an unreliable, non-FIFO network).
+    replicas.forEach((destReplica, destIdx) => {
+      const incoming = allOps.filter((entry) => entry.from !== destIdx).map((entry) => entry.op);
+      // Fisher-Yates shuffle using our deterministic RNG.
+      for (let i = incoming.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        [incoming[i], incoming[j]] = [incoming[j], incoming[i]];
+      }
+      incoming.forEach((op) => destReplica.applyRemote(op));
+    });
+
+    return replicas.map((r) => r.toText());
+  }
+
+  test("100 randomized trials all converge to identical text across all replicas", () => {
+    for (let trial = 0; trial < 100; trial++) {
+      const finalTexts = runConvergenceTrial(trial + 1);
+      const [first, ...rest] = finalTexts;
+      for (const text of rest) {
+        expect(text).toBe(first);
+      }
+    }
+  });
+});
